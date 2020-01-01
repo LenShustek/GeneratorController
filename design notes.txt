@@ -1,0 +1,111 @@
+DESIGN NOTES FOR A CUSTOM CUMMINS GENERATOR CONTROLLER
+
+
+Which generators and transfer switches I'm using
+------------------------------------------------
+
+I built two of these controllers for two locations with different equipment from 
+Cummins. In all cases, note that the ATS ("automatic transfer switch") design 
+only allows it to switch to a supply (utility or generator) that has power. 
+
+(1) RS22 22 kW generator and the RA100A transfer switch 
+
+In this case the generator is smart; it controls an engine cooldown period and 
+maintains its own exercise schedule. It responds to a "start generator" command 
+and provides a "generator ready" status. 
+
+The switch is dumb and only reacts to an "activate switch" input. It supplies 
+contact closures to indicate which way the switch is positioned, and whether the 
+utility power is present. We install only voltage and current sensors in the 
+switch, plus a bunch of wires. 
+
+(2) RS30000 30 kW generator and the RSS100 transfer switch "with controller" 
+
+In this case the generator is primitive; it obeys a "start generator" command 
+and does nothing else. No exercise periods, no engine cooldown, no "generator 
+ready" status. 
+
+The switch, on the other hand, is smart, with a microprocessor and some lights 
+and buttons. Their processor chooses the switch position, starts the generator, 
+enforces a cooldown period, and can establish an exercise schedule. We take over 
+the "generator start" line, but otherwise let the switch processor do its 
+thing. Our "connect to generator" relay output is not used. In addition to 
+voltage and current sensors, we install relays that provide contact closures so 
+we know whether utility and/or generator power is present. 
+
+When power fails, the ATS waits for generator power to be present before 
+activating the switch. Since we might delay starting the generator, it will 
+follow that delay. When we "rest" the generator, it leaves the switch alone as 
+long as utility power isn't present. The result is that our normal 
+"wait-run-rest-run" cycle works fine. 
+
+When utility power returns, it waits for TDEN ("time delay emergency to 
+normal"), which defaults to 10 minutes, before switching back to utility power. 
+Our "utility return delay" should therefore be at least that long so we don't 
+turn off the generator prematurely. See the Cummins "RSS100 and RSS200 Transfer
+Switch Service Manual" for instructions on setting TDEN to 5 minutes instead.
+
+We have taken over the "generator start" control line, so we need to implement 
+both an exercise schedule and an engine cooldown time, because their controller 
+can no longer do those. 
+
+In a future version of the controller we could add a third relay so that we can 
+separately control "connect to utility" and "connect to generator"; then we are 
+not dependent on the TDEN 10 minute delay to connect to the utility. That would
+require that we connect those control lines to us instead of their processor.
+It may not be worth it.
+
+Changes we make inside the ATS (automatic transfer switch) include:
+-------------------------------------------------------------------
+
+ - connect our control/status and sense wire harnesses to various points
+   inside the switch
+ - add a toggle switch that powers down our controller and returns to 
+   the normal factory mode of operation
+ - add two ferrite transducers around the house power cables that 
+   measure current draw of the load
+ - add two transducers that measure the generator and utility voltage
+ - for the RSS version, add two 240 VAC relays to indicate whether 
+   utility and/or generator power is present
+ 
+Design of the controller board
+------------------------------
+
+On one side of the PC board there are 7 pushbutton switches, a 20x4 LCD display, 
+and 6 LED indicators. It mounts directly to the front panel of the metal 
+enclosure using the switch nuts. The panel has holes for the switches and LEDs, 
+and a rectangular cutout for the LCD display. 
+
+The other side of the board contains all the other components including the two 
+harness connectors to the transfer switch, and the Wifi antenna connection on 
+the Airlift Wifi board. Many of the components are surface-mount, but I chose 
+largish versions (1/4 watt resistors instead of 1/8 watt, for example) so that 
+it's relatively easy to hand solder. 
+
+The Airlift board is a special version of the Adafruit product I built which 
+uses the ESP32 version that has a U.FL connector for an external antenna. 
+
+Electrical noise mitigation
+---------------------------
+
+Being located adjacent to a box where 100+ amps of power is switched in 
+milliseconds causes all sorts of wired and wireless RFI electrical noise 
+that can disrupt the electronics of our controller. Here are the steps 
+I took to mitigate that problem: 
+
+- a metal enclosure for the circuit board
+- an MOV transient voltage suppressor on the power input
+- a large low-pass inductor and big filtering caps on the power input
+- a diode array transient voltage suppressor on signals from outside the box
+- optical isolation for digital input signals
+- ground plane pours on both side of the PC board
+- transparent conductive film over the cutout for the LCD display
+- a deadman watchdog timer that resets the processor if it becomes catatonic
+- code that resets the LCD display whenever the power is switched
+
+That seems to have fixed the problem, but I have no idea which items were 
+most important and how much margin there is.
+
+Len Shustek
+December 2019
+

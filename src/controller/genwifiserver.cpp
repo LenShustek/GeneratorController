@@ -7,7 +7,7 @@
 
    As a web server we provide the current status page as the home page. There are also these subpages:
      /log         show the event log
-     /visitors    show the list of IP addesses who visited
+     /visitors    show the list of IP addresses who visited
      /pushbutton  push the button in the POST request "button=x"
                   and return the status page after a delay
                   that allows the button action to happen
@@ -17,12 +17,15 @@
      - it won't accept two simultaneous connections from the client, which the Chrome
        brower does for images
 
+   Also, the wifi module can get itself into a state where even a reset won't get it working.
+   It that case we drop and restore its power to try to get it running again.
+
    We also can act as a web client (browser) to issue triggers to IFTTT that cause emails
    and/or text messages to be sent.
 
    See the main module for other details and the change log.
    ----------------------------------------------------------------------------------------
-   Copyright (c) 2019, Len Shustek
+   Copyright (c) 2019,2020 Len Shustek
    The MIT License (MIT)
    Permission is hereby granted, free of charge, to any person obtaining a copy of this software
    and associated documentation files (the "Software"), to deal in the Software without
@@ -59,9 +62,7 @@
 
 #if WIFI
 
-#define MAX_IP_ADDRESSES 25
-#define CONNECT_DELAY_SECS 10   // how long to wait between network connect attempts
-#define MAX_CONNECT_ATTEMPTS 3  // (after that we reset the WiFi module)
+#define MAX_IP_ADDRESSES 50     // maximum visitors we keep track of
 #define DELAYED_RSP_MSEC 1000   // how long to delay an HTTP response for a button push to be processed
 
 WiFiServer server(WIFI_PORT); // 80 is standard; others are more secure
@@ -86,11 +87,13 @@ time_t next_connect_time = 0;  // when to next try to connect to the WiFi networ
 struct client_t { // history of the clients whose web browsers made requests
    IPAddress ip_address;
    long count;
+   time_t first_time, recent_time;
    bool gave_password; }
 clients[MAX_IP_ADDRESSES],
         *current_client;
 long requests_processed = 0;
 long wifi_connects = 0, wifi_connectfails = 0, wifi_disconnects = 0, wifi_resets = 0;
+long ifttt_queues = 0, ifttt_sends = 0, ifttt_successes = 0, ifttt_failures = 0;
 
 char linebuf[MAXLINE];
 
@@ -152,6 +155,7 @@ struct client_t * add_IP_address(WiFiClient *pclient) { // record this IP addres
    int empty_ndx = -1, min_ndx = -1, min_count = INT_MAX;
    for (int ndx = 0; ndx < MAX_IP_ADDRESSES; ++ndx) {
       if (clients[ndx].ip_address == addr) {// IP address is already in the table
+         clients[ndx].recent_time = now();
          return &clients[ndx]; }
       if (clients[ndx].count == 0) empty_ndx = ndx; // remember empty slot
       else if (clients[ndx].count < min_count) { // remember min count slot
@@ -160,7 +164,21 @@ struct client_t * add_IP_address(WiFiClient *pclient) { // record this IP addres
    clients[min_ndx].ip_address = addr; // create a new entry for it
    clients[min_ndx].count = 1;
    clients[min_ndx].gave_password = false;
+   clients[min_ndx].first_time = clients[min_ndx].recent_time = now();
    return &clients[min_ndx]; }
+
+void sort_clients(void) { // sort the client array by most-recent visit time
+   int next = 1;  // next element to sort in the insertion sort
+   while (next < MAX_IP_ADDRESSES) {
+      struct client_t temp;
+      int insert;
+      temp = clients[next];
+      insert = next - 1; // possible place to insert it
+      while (insert >= 0 && clients[insert].recent_time < temp.recent_time) {
+         clients[insert + 1] = clients[insert];
+         --insert; }
+      clients[insert + 1] = temp;
+      ++next; } }
 
 char *format_ip_address(IPAddress addr) {
    // WARNING: returns pointer to a static string!
@@ -209,6 +227,11 @@ void show_wifi_stats(void) {
    lcdprintf(1, "connect fails: %ld", wifi_connectfails);
    lcdprintf(2, "disconnects: %ld", wifi_disconnects);
    lcdprintf(3, "resets: %ld", wifi_resets);
+   delay_looksee();
+   lcdclear();
+   lcdprintf(0, "IFTTT queued: %ld", ifttt_queues);
+   lcdprintf(1, "IFTTT sent: %ld", ifttt_sends);
+   lcdprintf(2, "ok: %ld, failed: %ld", ifttt_successes, ifttt_failures);
    delay_looksee();
    lcdclear(); }
 
@@ -312,7 +335,7 @@ void generate_response(WiFiClient *pclient, enum response_type_t response_type) 
          0 };
       for (const char **ptr = response_header; *ptr; ++ptr)
          client_write(pclient, *ptr, strlen(*ptr), true);
-      client_printf(pclient, "<p style=\"font-size:large;\">&nbsp;&nbsp;&nbsp;&nbsp;%s</p><br>\r\n", format_datetime(now()));
+      client_printf(pclient, "<p style=\"font-size:large;\">&nbsp;&nbsp;&nbsp;&nbsp;%s</p><br>\r\n", format_datetime(now(), true));
 
       if (response_type == RSP_STATUS) {
          if (fatal_error) {
@@ -352,7 +375,7 @@ void generate_response(WiFiClient *pclient, enum response_type_t response_type) 
          if (logfile_hdr.num_entries > 0)
             for (int ndx = logfile_hdr.newest; ;) {
                client_printf(pclient, "%s  %s<br>\r\n",
-                             format_datetime(logfile[ndx].datetime),
+                             format_datetime(logfile[ndx].datetime, true),
                              event_names[logfile[ndx].event_type]);
                if (ndx == logfile_hdr.oldest) break;
                if (--ndx < 0) ndx = log_max_entries - 1; }
@@ -361,12 +384,17 @@ void generate_response(WiFiClient *pclient, enum response_type_t response_type) 
       else if (response_type == RSP_VISITORS) {
          client_printf(pclient, "<p style=\"font-size:medium;\">%d total requests processed<br><br>\r\n",
                        requests_processed);
+         sort_clients();
          for (int ndx = 0; ndx < MAX_IP_ADDRESSES; ++ndx)
             if (clients[ndx].count > 0) {
-               client_printf(pclient, "IP %s visited %d times%s<br>\r\n",
+               client_printf(pclient, "IP %s visited %d times, first at %s",
                              format_ip_address(clients[ndx].ip_address),
                              clients[ndx].count,
-                             clients[ndx].gave_password ? "; password was given" : ""); } }
+                             format_datetime(clients[ndx].first_time, true));
+               if (clients[ndx].recent_time != clients[ndx].first_time)
+                  client_printf(pclient, ", recently at %s", format_datetime(clients[ndx].recent_time, true));
+               client_printf(pclient, "%s<br>\r\n",
+                             clients[ndx].gave_password ? "; password given" : ""); } }
 
       else if (response_type == RSP_ASKPASS) {
          client_printf(pclient, "<form action=\"setpass.html\" method=\"post\">\r\n");
@@ -473,7 +501,8 @@ void ifttt_send_trigger(WiFiClient *pclient) {
       Serial.print("sending IFTTT trigger with value1 data \""); Serial.print(ifttt_data); Serial.println('"');
       showing_screen = false; }
    pclient->stop();
-   log_event(EV_IFTTT_SENDING, ifttt_data);
+   if (IFTTT_LOG) log_eventf(EV_IFTTT_SENDING, "\"%s\"", ifttt_data);
+   ++ifttt_sends;
    if (pclient->connect(ifttt_server, 80)) { // send the trigger
       sprintf(json_string, "{\"value1\" : \"%s\"}", ifttt_data);
       client_printf(pclient, "POST %s HTTP/1.1\r\n", ifttt_path);
@@ -491,14 +520,21 @@ void ifttt_send_trigger(WiFiClient *pclient) {
          Serial.println();
          showing_screen = false; }
       pclient->stop();
-      log_event(EV_IFTTT_SENT); }
+      if (IFTTT_LOG) log_event(EV_IFTTT_SENT); // success!
+      ++ifttt_successes;
+      ifttt_do_trigger = false; }
    else { // failed
       if (DEBUG) {
          Serial.println("failed to connect to IFTTT server");
          Serial.print("WiFi.status="); Serial.print(WiFi.status());
          Serial.print(", client.status="); Serial.println(pclient->status());
          showing_screen = false; }
-      log_event(EV_IFTTT_FAILED); } }
+      if (IFTTT_LOG) log_event(EV_IFTTT_FAILED);
+      ++ifttt_failures;
+      if (++ifttt_retry_count > IFTTT_RETRIES)
+         ifttt_do_trigger = false; // too many retries: give up
+      else ifttt_trytime_millis = millis(); // otherwise schedule another attempt
+   } }
 #endif
 
 void process_web(void) {
@@ -533,7 +569,7 @@ void process_web(void) {
                #endif
                SEROUT("begin");
                digitalWrite(WIFI_LED, WIFI_LED_ON); // turn LED on to show the attempt
-               // This can block for as long as 50 seconds! So our watchdog timeout should be longer.
+               // This can block for as long as 50 seconds! So our watchdog timeout must be longer.
                int connectstatus = WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
                SEROUT("began");
                if (DEBUG) {
@@ -549,9 +585,9 @@ void process_web(void) {
 
          case WEB_AWAITING_CONNECTION:
             switch (WiFi.status()) {
-               case WL_CONNECTED:
+               case WL_CONNECTED: // successful connection to WiFi network
                   ++wifi_connects;
-                  //log_event(EV_WIFI_CONNECTED);
+                  if (WIFI_LOG) log_event(EV_WIFI_CONNECTED);
                   if (DEBUG) {
                      Serial.print("starting server on port "); Serial.println(WIFI_PORT);
                      showing_screen = false; }
@@ -564,14 +600,15 @@ void process_web(void) {
                   digitalWrite(WIFI_LED, WIFI_LED_ON);;
                   show_wifi_mac_info();
                   show_wifi_network_info();
+                  ifttt_trytime_millis = millis(); //make IFTTT triggers wait for a while
                   break;
                case WL_IDLE_STATUS:
                   SEROUT("wait");
                   break;
-               default: // connection failed
+               default: // connection to WiFi network failed
                   digitalWrite(WIFI_LED, WIFI_LED_OFF);
                   ++wifi_connectfails;
-                  //log_event(EV_WIFI_NOCONNECT);
+                  if (WIFI_LOG) log_event(EV_WIFI_NOCONNECT);
                   if (DEBUG) {
                      Serial.println("Failed to connect");
                      showing_screen = false; }
@@ -579,8 +616,7 @@ void process_web(void) {
                      if (DEBUG) {
                         Serial.println("Too many connection attempts; resetting WiFi module");
                         showing_screen = false; }
-                     ++wifi_resets;
-                     //log_event(EV_WIFI_RESET);
+                     if (WIFI_LOG) log_event(EV_WIFI_RESET);
                      wifi_reset();
                      connect_attempts = 0; }
                   next_connect_time = now() + CONNECT_DELAY_SECS; // when to try next
@@ -590,13 +626,12 @@ void process_web(void) {
          case WEB_AWAITING_CLIENT:
             if (WiFi.status() != WL_CONNECTED) { // we were dumped from the network
                ++wifi_disconnects;
-               //log_event(EV_WIFI_DISCONNECTED);
+               if (WIFI_LOG) log_event(EV_WIFI_DISCONNECTED);
                // try resetting, since otherwise we can't reconnect to the Google Wifi router
                if (DEBUG) {
                   Serial.println("Dumped from network; resetting WiFi module");
                   showing_screen = false; }
-               ++wifi_resets;
-               //log_event(EV_WIFI_RESET);
+               if (WIFI_LOG) log_event(EV_WIFI_RESET);
                wifi_reset();
                connect_attempts = 0;
                next_connect_time = now() + CONNECT_DELAY_SECS; // when to try next
@@ -607,9 +642,9 @@ void process_web(void) {
                   web_status = WEB_PROCESSING_REQUEST;
                   process_client_request(&client); }
                #ifdef IFTTT_EVENT
-               else if (ifttt_do_trigger) {  // we're idle and can process an outgoing trigger
-                  ifttt_send_trigger(&client);
-                  ifttt_do_trigger = false; }
+               else if (ifttt_do_trigger  // we're idle so could process an outgoing trigger
+                        && millis() - ifttt_trytime_millis >= IFTTT_DELAY_SECS * 1000) { // if it's time
+                  ifttt_send_trigger(&client); } // make an attempt
                #endif
             }
             break;

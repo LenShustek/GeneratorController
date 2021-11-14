@@ -28,7 +28,7 @@
    - two relays for controlling the generator and the transfer switch
    - an Adafruit AirLift ESP32 WiFi Co-Processor module
        https://www.adafruit.com/product/4201
-   - a Teensy 3.5 processor, which is fast and has lots of I/O pins
+   - a Teensy 3.5 32-bit RISC processor, running at 48 Mhz to reduce power consumption
         https://www.pjrc.com/store/teensy35.html
    - various noise-supression techniques were added, because switching 100+ amps nearby causes havoc with electronics
         Littelfuse SP721 transient voltage suppressor diode arrays on signals from outside the box
@@ -92,15 +92,25 @@
     - Don't create log entries for Wifi disconnect/connect; happens too frequently.
       Instead, keep statistics and report from the "show wifi info" submenu.
     - Add ; to end of &xx HTML character references like &nbsp; some browsers insist.
-
-   Bugs:
-   - battery voltage at power fail is too low? Change caps for A-to-D? Delay before reading?
-
+   08 Jan 2020, V2.5, L. Shustek
+    - Don't test battery voltage until several seconds after power is off,
+      otherwise something (the charger shutdown?) makes it incorrect.
+    - Retry IFTTT trigger sends several times, a few seconds apart, and don't even
+      do the first try until several seconds after we are connected to the network.
+   10 Aug 2020, V2.6, L. Shustek
+    - record and show the first and most recent date/time in the web visitor history
+    1 Oct 2020, V2.7, L. Shustek
+    - sort the visitor log by most recent date/time
+   28 Aug 2021, V2.8, L. Shustek
+    - After every few Wifi module reset attempts, drop and restore its power
+      in an attempt to get it going again.
+   
    Ideas:
+   - better wifi rejoin attempts after power is restored (fails at the Lodge)
    - util_on and gen_on: also check voltage sense? Needed for RSS transfer switch?
 
    ------------------------------------------------------------------------------------------------
-   Copyright (c) 2019, Len Shustek
+   Copyright (c) 2019,2020, Len Shustek
    The MIT License (MIT)
    Permission is hereby granted, free of charge, to any person obtaining a copy of this software
    and associated documentation files (the "Software"), to deal in the Software without
@@ -119,7 +129,7 @@
    ------------------------------------------------------------------------------------------------*/
 
 #include "generator.h"
-#define VERSION "2.4"
+#define VERSION "2.8"
 
 // Here are the defaults that are put into non-volatile memory the first time.
 // They may be changed using the configuration menu.
@@ -142,8 +152,8 @@
 #define TIMEOUT_GEN_STOP_SECS 5         // how long we give the generator to stop
 //                                         (not obeyed for RS22-type generators)
 
-#define BATTERY_WARNING_LEVEL 12.0      // volts below which to warn about the starter battery
-#define BATTERY_CHECK_DELAY_MSEC 1000   // delay after power fail before checking battery and then maybe starting gen
+#define BATTERY_WARNING_LEVEL 11.9      // volts below which to warn about the starter battery
+#define BATTERY_CHECK_DELAY_SECS 5      // delay after power fail before (and between) checking battery voltage
 #define BATTERY_WARNING_HYSTERESIS 0.2  // hysteresis gap to avoid repeated warnings
 
 #define GEN_REST_CURRENT_LIMIT 25       // amps above which we won't rest the generator
@@ -170,6 +180,8 @@ bool exercising = false;
 unsigned long exercise_start_millis;
 bool ifttt_do_trigger = false;
 const char *ifttt_data; // "failed", or "restored", or "test"
+int ifttt_retry_count;
+unsigned long ifttt_trytime_millis;
 time_t last_poweron_time = 0; // When power last came on, either generator or utility
 
 const char *event_names[] = { // must match enum in generator.h
@@ -181,9 +193,9 @@ const char *event_names[] = { // must match enum in generator.h
    "connect to generator", "couldn't connect to generator", "gen connect with gen off!",
    "connect to utility", "couldn't connect to utility", "util connect with util off!",
    "WiFi module reset", "Wifi connected", "WiFi no connect", "WiFi disconnected",
-   "assertion error", "watchdog reset", "starter battery weak", "configuration updated",
+   "assertion error", "watchdog reset", "starter battery read", "starter battery weak", "configuration updated",
    "exercise started", "exercise ended",
-   "IFTTT queued", "IFTTT sending", "IFTTT sent", "IFTTT failed" };
+   "IFTTT queued:", "IFTTT sending:", "IFTTT sent", "IFTTT failed", "event:" };
 // If the following gets a compile error, there is a mismatch with the enum declaration.
 typedef char event_name_error[sizeof(event_names) / sizeof(event_names[0]) == EV_NUM_EVENTS ? 1 : -1];
 
@@ -195,7 +207,7 @@ typedef char event_name_error[sizeof(event_names) / sizeof(event_names[0]) == EV
 #define CONFIG_HDR_LOC 0
 struct { // local copy of the configuration data in EEPROM
    char id[6];  // "GENnn"      // unique header ID w/ format version number
-#define ID_STRING "GEN03"
+#define ID_STRING "GEN04"       // change this to force the config and log to be rebuilt
    unsigned short gen_delay_mins;    // how many minutes to wait before turning generator on
    unsigned short gen_run_mins;      // how many minutes to run the generator for
    unsigned short gen_rest_mins;     // how many minutes to rest the generator between runs
@@ -270,6 +282,7 @@ int lcdrow /* 0..3 */, lcdcol /* 0..19 */;
 
 #if LCD_HW
 LiquidCrystal lcdhw (LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+bool lcdWiFi_on = false;
 
 void lcd_start(void) {
    static uint8_t downarrow_char[8] = {
@@ -459,6 +472,14 @@ void center_message (byte row, const char *msg) { // show a one- or two-line mes
    }
    lcddumpscreen(); }
 
+void center_messagef (byte row, const char *msg, ...) {
+   char buf[50];
+   va_list arg_ptr;
+   va_start(arg_ptr, msg);
+   vsnprintf(buf, sizeof(buf), msg, arg_ptr);
+   center_message(row, buf);
+   va_end(arg_ptr); }
+
 //void long_message(byte row, const char *msg) { // print a string multiple lines long
 //   center_message(row, ""); lcdsetrow(row);
 //   for (byte i = 0; i < (byte)strlen(msg); ++i) {
@@ -538,14 +559,14 @@ void idle(void) {   // the idling routine while we're waiting for something
    update_bools();
    if (have_wifi_module) process_web(); }
 
-void delay_long(unsigned long timeleft) {  // a long delay, during which web processing happens
-   while (timeleft > 0) {
+void delay_looksee(void) { // a long delay that allows for viewing something
+   long timeleft = LOOKSEE;
+   while (timeleft > 0 ||
+          digitalRead(button_pins[MENU_BUTTON]) == LOW) { // hold if MENU pushed
       delay(SMIDGE);
       idle();
       timeleft -= SMIDGE; } }
 
-void delay_looksee(void) { // a long delay that allows for viewing something
-   delay_long(LOOKSEE); }
 
 //-----------------------------------------------------------------------------------------
 // scan routines
@@ -669,15 +690,11 @@ void show_voltage_current(byte row) {
       int Ph2A = (int)analog(LOAD_CURRENT2, CURRENT_EXAMPLE, CURRENT_ANALOG);
       if (digitalRead(LEFT_BUTTON_PIN) == 0) Ph2A = 75; //TEMP for testing
       last_max_current = max(Ph1A, Ph2A);
-      char string[40];
-      sprintf(string, "%d VAC  %dA, %dA", voltage, Ph1A, Ph2A);
-      center_message(row, string); } }
+      center_messagef(row, "%d VAC  %dA, %dA", voltage, Ph1A, Ph2A); } }
 
 void show_battery_voltage(byte row) {
    float battV = analog(BATT_VOLTAGE, BATT_EXAMPLE, BATT_ANALOG) + BATT_VOLTAGE_ADJ;
-   char string[40];
-   sprintf(string, "Gen battery %.1fV", battV);
-   center_message(row, string); }
+   center_messagef(row, "Gen battery %.1fV", battV); }
 
 // We only check for low starter battery voltage during a power failure
 // without the generator running, because otherwise we're really just
@@ -687,8 +704,8 @@ bool do_battery_warning = false;
 float poweroff_battery_voltage;
 
 void check_battery_voltage(void) {
-   delay(SMIDGE); // make sure voltage is stable
    poweroff_battery_voltage = analog(BATT_VOLTAGE, BATT_EXAMPLE, BATT_ANALOG) + BATT_VOLTAGE_ADJ;
+   //log_event(EV_BATTERY_READ, (short int) (poweroff_battery_voltage * 10));
    if (poweroff_battery_voltage < BATTERY_WARNING_LEVEL - BATTERY_WARNING_HYSTERESIS / 2) {
       if (!do_battery_warning) log_event(EV_BATTERY_WEAK, (short int) (poweroff_battery_voltage * 10));
       do_battery_warning = true; }
@@ -697,9 +714,7 @@ void check_battery_voltage(void) {
 
 void show_battery_warning(int row) {
    center_message(row, "starter battery weak");
-   char string[40];
-   sprintf(string, "It was %.1fV at the last power failure", poweroff_battery_voltage);
-   center_message(row + 1, string); }
+   center_messagef(row + 1, "It was %.1fV at the last power failure", poweroff_battery_voltage); }
 
 void clear_battery_warning(void) {
    do_battery_warning = false; }
@@ -745,9 +760,7 @@ void read_config(void) {
          eeprom_read(LOGFILE_LOC + ndx * sizeof(struct logentry_t),
                      sizeof(struct logentry_t), (byte *)&logfile[ndx]);
          if (++ndx >= LOG_MAX) ndx = 0; } }
-   char string[40];
-   sprintf(string, "log: %d of %d", logfile_hdr.num_entries, LOG_MAX);
-   center_message(2, string);
+   center_messagef(2, "log: %d of %d", logfile_hdr.num_entries, LOG_MAX);
    delay(LOOKSEE); }
 
 void update_config(void) {
@@ -757,13 +770,13 @@ void update_config(void) {
 //      event log routines
 //--------------------------------------------------------------------------
 
-void log_event(byte event_type) {  // make event log entry with no extra info
+void log_event(byte event_type) {
    #if DEBUG
    Serial.print("log: "); Serial.print(event_names[event_type]);
    #endif
    do_log_event(event_type, 0, ""); }
 
-void log_event(byte event_type, short int extra_info) { // make event log entry with extra info
+void log_event(byte event_type, short int extra_info) {
    #if DEBUG
    Serial.print("log: "); Serial.print(event_names[event_type]);
    Serial.print(", "); Serial.print(extra_info, HEX);
@@ -777,6 +790,15 @@ void log_event(byte event_type, const char *msg) {
    #endif
    do_log_event(event_type, 0, msg); }
 
+void log_eventf(byte event_type, const char *msg, ...) {
+   char buf[40];
+   va_list arg_ptr;
+   va_start(arg_ptr, msg);
+   vsnprintf(buf, sizeof(buf), msg, arg_ptr);
+   assert(strlen(buf) <= 20, "bad log_eventf(msg,..)");
+   log_event(event_type, buf);
+   va_end(arg_ptr); }
+
 void log_event(byte event_type, short int extra_info, const char *msg) {
    #if DEBUG
    Serial.print("log: "); Serial.print(event_names[event_type]);
@@ -787,7 +809,7 @@ void log_event(byte event_type, short int extra_info, const char *msg) {
 
 void do_log_event(byte event_type, short int extra_info, const char *msg) {
    #if DEBUG
-   Serial.print(" at "); Serial.println(format_datetime(now()));
+   Serial.print(" at "); Serial.println(format_datetime(now(), true));
    showing_screen = false;
    #endif
    if (logfile_hdr.num_entries == 0) logfile_hdr.num_entries = 1;
@@ -807,59 +829,54 @@ void do_log_event(byte event_type, short int extra_info, const char *msg) {
                 sizeof(struct logentry_t),
                 (byte *) &logfile[logfile_hdr.newest]); }
 
-void show_event_log(void) {
-   int ndx = -1;
-   int num = logfile_hdr.num_entries;
+void log_show_events(void) {
+   int num, ndx = -1;
    char string[40];
    if (logfile_hdr.num_entries == 0) {
-      lcdclear(); center_message(1, "log is empty");
-      delay_looksee();
+      lcdclear(); center_message(1, "log is empty"); delay_looksee();
       return; }
-   sprintf(string, "%d log events", logfile_hdr.num_entries);
-   center_message(0, string);
+   center_messagef(0, "%d log events", logfile_hdr.num_entries);
    center_message(1, "");
    center_message(2, LEFTARROW " " RIGHTARROW " to scroll");
    center_message(3, "then MENU to exit");
-   while (1) {
-      switch (wait_for_button()) {
-         case MENU_BUTTON:
-            return;
-         case RIGHT_BUTTON:
-            if (ndx == -1) ndx = logfile_hdr.newest;
+   while (1) { // until "menu" pressed
+      while (1) { // until a relevant button is pressed
+         byte button = wait_for_button();
+         if (button == MENU_BUTTON) return;
+         if (button == RIGHT_BUTTON) {
+            if (ndx == -1) {
+               ndx = logfile_hdr.oldest;
+               num = 1; }
             else if (ndx != logfile_hdr.newest && ++num && ++ndx >= (int)LOG_MAX) ndx = 0;
-            break;
-         case LEFT_BUTTON:
-            if (ndx == -1) ndx = logfile_hdr.newest;
+            break; }
+         if (button == LEFT_BUTTON) {
+            if (ndx == -1) {
+               ndx = logfile_hdr.newest;
+               num = logfile_hdr.num_entries; }
             else if (ndx != logfile_hdr.oldest && --num && --ndx < 0) ndx = LOG_MAX - 1;
+            break; } }
+      assert (ndx != -1, "log_show_events err");
+      center_messagef(0, "event %u of %u", num, logfile_hdr.num_entries);
+      show_datetime(1, logfile[ndx].datetime, true);
+      center_message(3, ""); // the event type description might be 1 or 2 lines
+      center_message(2, event_names[logfile[ndx].event_type]); // show it
+      if (logfile[ndx].msg[0]) { // display optional message, if any
+         memcpy(string, logfile[ndx].msg, LOG_MSGSIZE);
+         string[LOG_MSGSIZE] = 0; // make sure it's 0-terminated
+         center_message(3, string); } // (might overwrite 2nd line of description)
+      short int extra_info = logfile[ndx].extra_info;
+      switch (logfile[ndx].event_type) {  // display extra info
+         case EV_BATTERY_WEAK: // voltage in tenths of a volt
+         case EV_BATTERY_READ:
+            center_messagef(3, "%d.%1dV", extra_info / 10, extra_info % 10);
             break;
-         default: ; // ignore others
-      }
-      if (logfile_hdr.num_entries > 0) {
-         if (ndx == -1) ndx = logfile_hdr.newest;
-         sprintf(string, "event %u of %u", num, logfile_hdr.num_entries);
-         center_message(0, string);
-         show_datetime(1, logfile[ndx].datetime);
-         center_message(3, ""); // the event type description might be 1 or 2 lines
-         center_message(2, event_names[logfile[ndx].event_type]); // show it
-         if (logfile[ndx].msg[0]) { // display optional message, if any
-            memcpy(string, logfile[ndx].msg, LOG_MSGSIZE);
-            string[LOG_MSGSIZE] = 0; // make sure it's 0-terminated
-            center_message(3, string); } // (might overwrite 2nd line of description)
-         short int extra_info = logfile[ndx].extra_info;
-         switch (logfile[ndx].event_type) {  // display extra info, if any
-               char string[30]; // (in which case the title should be one line)
-            case EV_BATTERY_WEAK: // voltage in tenths of a volt
-               sprintf(string, "%d.%1dV", extra_info / 10, extra_info % 10);
-               center_message(3, string);
-               break;
-            case EV_ASSERTION:
-               sprintf(string, "%04X", extra_info);
-               center_message(3, string);
-               break;
-            case EV_WATCHDOG_RESET:
-               sprintf(string, "%d time%c", extra_info, extra_info > 1 ? 's' : ' ');
-               center_message(3, string);
-               break; } } } }
+         case EV_ASSERTION:
+         case EV_MISC:
+            center_messagef(3, "%04X", extra_info);
+            break;
+         case EV_WATCHDOG_RESET:
+            center_messagef(3, "%d time%c", extra_info, extra_info > 1 ? 's' : ' ');
+            break; } } }
 
 void clear_log(void) {
    logfile_hdr.num_entries = 0;
@@ -897,7 +914,7 @@ void use_am (TimeElements * timeparts, bool am) { // convert back to 24-hour clo
    else { //pm
       if (timeparts->Hour < 12) timeparts->Hour += 12; } }
 
-char *format_datetime(time_t thetime) {
+char *format_datetime(time_t thetime, bool showsecs) {
    //WARNING: returns pointer to static string
    static char string[40];
    TimeElements timeparts;
@@ -905,17 +922,25 @@ char *format_datetime(time_t thetime) {
    if (timeparts.Year < 30) { // something is very wrong with the time
       sprintf(string, "?? ??? ???? ??:?? ??"); }
    else {
-      bool am = get_am(&timeparts);
-      sprintf(string, "%2u %3.3s 20%02u %2u:%02u %cM",
-              min(timeparts.Day, 99),
-              months[timeparts.Month > 12 ? 0 : timeparts.Month],
-              min(timeparts.Year - 30, 99),
-              min(timeparts.Hour, 99), min(timeparts.Minute, 99),
-              am ? 'A' : 'P'); }
+      if (showsecs)
+         sprintf(string, "%2u %3.3s 20%02u %2u:%02u:%.02u",
+                 min(timeparts.Day, 99),
+                 months[timeparts.Month > 12 ? 0 : timeparts.Month],
+                 min(timeparts.Year - 30, 99),
+                 min(timeparts.Hour, 99), min(timeparts.Minute, 99),
+                 min(timeparts.Second, 99));
+      else {
+         bool am = get_am(&timeparts);
+         sprintf(string, "%2u %3.3s 20%02u %2u:%02u %cM",
+                 min(timeparts.Day, 99),
+                 months[timeparts.Month > 12 ? 0 : timeparts.Month],
+                 min(timeparts.Year - 30, 99),
+                 min(timeparts.Hour, 99), min(timeparts.Minute, 99),
+                 am ? 'A' : 'P'); } }
    return string; }
 
-void show_datetime(byte row, time_t thetime) {
-   lcdprint(row, format_datetime(thetime)); }
+void show_datetime(byte row, time_t thetime, bool showsecs) {
+   lcdprint(row, format_datetime(thetime, showsecs)); }
 
 time_t getTeensy3Time() {
    return Teensy3Clock.get(); }
@@ -974,7 +999,7 @@ void set_date(bool parameter) {  //********* change the current date and time
    time_t newdatetime = now();
    byte field = 0; // start with first field
    while (true) {
-      show_datetime(CONFIG_ROW, newdatetime); // curent values
+      show_datetime(CONFIG_ROW, newdatetime, false); // curent values
       breakTime(newdatetime, timeparts);
       bool am = get_am(&timeparts);
       delta = get_config_changes(config_date_columns, &field);
@@ -1146,8 +1171,11 @@ void do_configuration (void) { // set configuration parameters
 #ifdef IFTTT_EVENT
 void ifttt_trigger(const char *msg) {
    ifttt_data = msg;
+   ifttt_retry_count = 0;
+   ifttt_trytime_millis = millis();
    ifttt_do_trigger = true;
-   log_event(EV_IFTTT_QUEUED, ifttt_data);
+   if (IFTTT_LOG) log_eventf(EV_IFTTT_QUEUED, "\"%s\"", ifttt_data);
+   ++ifttt_queues;
    if (DEBUG) {
       Serial.print("IFTTT trigger queued: \""); Serial.print(ifttt_data); Serial.println('\"');
       showing_screen = false; } }
@@ -1250,8 +1278,11 @@ bool utility_back(bool do_delay) {
          return false; } }
    if (!connect_to_utility()) return false;
 
-   // we're on utility power; let the generator cool down with no load
-   if (config_hdr.gen_cooldown_mins != 0) {
+   // we're on utility power
+   #ifdef IFTTT_EVENT
+   ifttt_trigger("restored");
+   #endif
+   if (config_hdr.gen_cooldown_mins != 0) { //   let the generator cool down with no load
       log_event(EV_GEN_COOLDOWN);
       time_t gen_stop_datetime = now() + MINS_TO_SECS((time_t) config_hdr.gen_cooldown_mins);
       while (do_delay && gen_on.val && now() < gen_stop_datetime) {
@@ -1263,10 +1294,6 @@ bool utility_back(bool do_delay) {
             show_error(EV_UTIL_FAIL);
             return false; } } }
    stop_generator();
-
-   #ifdef IFTTT_EVENT
-   ifttt_trigger("restored");
-   #endif
 
    return true; }
 
@@ -1331,7 +1358,7 @@ void show_exercise_info (void) {
       center_message(0, "no previous exercise");
    else {
       center_message(0, "last exercise:");
-      show_datetime(1, config_hdr.exer_last); }
+      show_datetime(1, config_hdr.exer_last, false); }
    if (config_hdr.exer_duration_mins == 0)
       center_message(2, "no exercise coming");
    else {
@@ -1354,7 +1381,8 @@ void show_exercise_info (void) {
               timeparts.Day, months[timeparts.Month], timeparts.Year - 30,
               timeparts.Hour, timeparts.Minute, am ? 'A' : 'P');
       lcdprint(3, string); }
-   delay_long(LOOKSEE * 2); }
+   delay_looksee();
+   delay_looksee(); }
 
 void genswitch_control(void) {
    const static struct  {  // manual control routines
@@ -1384,37 +1412,42 @@ void util_failed(void) {
    bool gen_stay_on = (config_hdr.gen_run_mins == FOREVER);
    time_t util_off_datetime = now();
    time_t gen_start_datetime;
-   lcdclear();
 
+   lcdclear();
    #ifdef IFTTT_EVENT     // queue sending a text and/or an email
    ifttt_trigger("failed");
    #endif
    idle();
+   time_t last_batterycheck_datetime = util_off_datetime;
 
    if (!gen_connected.val && !gen_on.val) { // the power must have just failed
       log_event(EV_UTIL_FAIL);
-      // checking battery voltage too soon gives bad results, maybe because the
-      // battery charger is powering down?
-      delay_long(BATTERY_CHECK_DELAY_MSEC);
-      check_battery_voltage();
+      //checking battery voltage too soon gives bad results, maybe because the
+      //battery charger is powering down? Do it later, after a while.
+      //check_battery_voltage();
       gen_start_datetime = util_off_datetime  + MINS_TO_SECS((time_t) config_hdr.gen_delay_mins);
       while (!athome && now() < gen_start_datetime) {  // wait until we should start the generator
          idle();
          if (util_on.val) {
             center_message(2, "power back before generator started");
             log_event(EV_POWER_BACK);
+            #ifdef IFTTT_EVENT
+            ifttt_trigger("restored");
+            #endif
             delay_looksee();
             return; }
-         check_battery_voltage();
+         if (now() > last_batterycheck_datetime + BATTERY_CHECK_DELAY_SECS) { // after a while,
+            check_battery_voltage();
+            last_batterycheck_datetime = now(); }
          if (start_gen_now_button())  // the gen start/stop button forces it
             break;
          center_message(0, "power went off at");
-         show_datetime(1, util_off_datetime);
+         show_datetime(1, util_off_datetime, false);
          timeleft_message("generator on in", gen_start_datetime - now()); } }
 
    else  { // we started up with the generator running and/or connected
       center_message(0, "generator already on / connected at");
-      show_datetime(2, util_off_datetime);
+      show_datetime(2, util_off_datetime, false);
       delay_looksee(); }
 
    // the loop we repeat until power returns
@@ -1465,9 +1498,7 @@ void util_failed(void) {
 
 void show_version(void) {
    lcdclear();
-   char string[40];
-   sprintf(string, "version %s", VERSION);
-   center_message(0, string);
+   center_messagef(0, "version %s", VERSION);
    center_message(1, "compiled");
    center_message(2, __DATE__);
    center_message(3, __TIME__); }
@@ -1533,7 +1564,7 @@ void menu_pushed (void) {
       const char *title;
       void (*fct)(void); }
    menu_cmds [] = {
-      {"show event log?", show_event_log },
+      {"show event log?", log_show_events },
       #if WIFI
       {"show WiFi info?", show_wifi_info },
       #endif
@@ -1611,19 +1642,20 @@ void hardware_tests(void) {
       while (millis() - start_time < 5 * 1000); }
 
    if (0) { // test display/WiFi power switching
-      lcdclear(); lcdprint("Menu : display off");
       unsigned long start_time = millis();
-      do {
+      lcdclear();
+      while (digitalRead(GEN_BUTTON_PIN) != 0) {
+         lcdprint(0, "Menu: display off");
+         lcdprint(1, "Gen: done");
+         timeleft_message("time on", (millis() - start_time) / 1000);
          if (digitalRead(MENU_BUTTON_PIN) == 0) {
             lcdWiFi_poweroff();
             delay(DEBOUNCE);
             while (digitalRead(MENU_BUTTON_PIN) == 0) watchdog_poke();
             lcdWiFi_poweron();
             delay(SMIDGE); // wait for cap to charge up
-            // do we need to reinitialize the display?
-            lcdclear(); lcdprint("Menu : display off");
-            start_time = millis(); } }
-      while (millis() - start_time < 5 * 1000); }
+            lcd_start();
+            start_time = millis(); } } }
 
    if (0) { // test watchdog timer reset
       lcdclear(); lcdprint("Menu : stop watchdog");
@@ -1636,19 +1668,15 @@ void hardware_tests(void) {
 void show_analog(void) {  // show analog inputs every half second
    static unsigned long last_analog = 0;
    if (millis() - last_analog > 500) {
-      char string[40];
       last_analog = millis();
       float genV = analog(GEN_VOLTAGE, VOLTAGE_EXAMPLE, VOLTAGE_ANALOG);
       float utilV = analog(UTIL_VOLTAGE, VOLTAGE_EXAMPLE, VOLTAGE_ANALOG);
-      sprintf(string, "Gen %dV, Util %dV", (int)genV, (int)utilV);
-      center_message(1, string);
+      center_messagef(1, "Gen %dV, Util %dV", (int)genV, (int)utilV);
       float Ph1A = analog(LOAD_CURRENT1, CURRENT_EXAMPLE, CURRENT_ANALOG);
       float Ph2A = analog(LOAD_CURRENT2, CURRENT_EXAMPLE, CURRENT_ANALOG);
-      sprintf(string, "Ph1 %dA, Ph2 %dA", (int)Ph1A, (int)Ph2A);
-      center_message(2, string);
+      center_messagef(2, "Ph1 %dA, Ph2 %dA", (int)Ph1A, (int)Ph2A);
       float battV = analog(BATT_VOLTAGE, BATT_EXAMPLE, BATT_ANALOG) + BATT_VOLTAGE_ADJ;
-      sprintf(string, "Gen batt %.1fV", battV);
-      center_message(3, string); } }
+      center_messagef(3, "Gen batt %.1fV", battV); } }
 #endif
 
 //-----------------------------------------------------------------------
@@ -1657,6 +1685,14 @@ void show_analog(void) {  // show analog inputs every half second
 
 #if WIFI
 void wifi_reset(void) {
+   ++wifi_resets;
+   if (wifi_resets % MAX_WIFI_RESETS == 0) { // every few resets, drop the power
+      lcdWiFi_poweroff();
+      delay(500);
+      lcdWiFi_poweron();
+      delay(500);
+      lcd_restart(); 
+   }
    digitalWrite(WIFI_RST, 0); // reset the WiFI module
    delay(250);
    digitalWrite(WIFI_RST, 1);
@@ -1702,7 +1738,7 @@ void setup(void) {
    #if DEBUG
    Serial.begin(115200);
    if (!LCD_HW) while (!Serial) ; // wait for puTTY
-   Serial.print("Controller started at "); Serial.println(format_datetime(now()));
+   Serial.print("Controller started at "); Serial.println(format_datetime(now(), true));
    #endif
 
    #if DEBUGSER
@@ -1799,7 +1835,7 @@ void loop(void) {
       switch (headline) { // update the display
          case PLACENAME: center_message(0, TITLE); show_voltage_current(2);
             break;
-         case DATETIME: show_datetime(0, now()); show_voltage_current(2);
+         case DATETIME: show_datetime(0, now(), false); show_voltage_current(2);
             break;
          case BATTERYWARN: show_battery_warning(1);
             break;
